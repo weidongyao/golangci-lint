@@ -221,22 +221,17 @@ func (p *Nolint) extractInlineRangeFromComment(text string, g ast.Node, fset *to
 	var gotUnknownLinters bool
 	for _, linter := range linterItems {
 		linterName := strings.ToLower(strings.TrimSpace(linter))
-		metaLinter := p.dbManager.GetMetaLinter(linterName)
-		if metaLinter != nil {
-			// user can set metalinter name in nolint directive (e.g. megacheck), then
-			// we should add to nolint all the metalinter's default children
-			linters = append(linters, metaLinter.DefaultChildLinterNames()...)
-			continue
-		}
 
-		lc := p.dbManager.GetLinterConfig(linterName)
-		if lc == nil {
+		lcs := p.dbManager.GetLinterConfigs(linterName)
+		if lcs == nil {
 			p.unknownLintersSet[linterName] = true
 			gotUnknownLinters = true
 			continue
 		}
 
-		linters = append(linters, lc.Name()) // normalize name to work with aliases
+		for _, lc := range lcs {
+			linters = append(linters, lc.Name()) // normalize name to work with aliases
+		}
 	}
 
 	if gotUnknownLinters {

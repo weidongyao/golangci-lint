@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golangci/golangci-lint/internal/errorutil"
@@ -129,8 +127,6 @@ func (r *Runner) runLinterSafe(ctx context.Context, lintCtx *linter.Context,
 
 func (r Runner) runWorker(ctx context.Context, lintCtx *linter.Context,
 	tasksCh <-chan *linter.Config, lintResultsCh chan<- lintRes, name string) {
-	sw := timeutils.NewStopwatch(name, r.Log)
-	defer sw.Print()
 
 	for {
 		select {
@@ -147,9 +143,7 @@ func (r Runner) runWorker(ctx context.Context, lintCtx *linter.Context,
 			}
 			var issues []result.Issue
 			var err error
-			sw.TrackStage(lc.Name(), func() {
-				issues, err = r.runLinterSafe(ctx, lintCtx, lc)
-			})
+
 			lintResultsCh <- lintRes{
 				linter: lc,
 				err:    err,
@@ -179,96 +173,40 @@ func (r Runner) logWorkersStat(workersFinishTimes []time.Time) {
 	r.Log.Infof("Workers idle times: %s", strings.Join(logStrings, ", "))
 }
 
-func getSortedLintersConfigs(linters []*linter.Config) []*linter.Config {
-	ret := make([]*linter.Config, len(linters))
-	copy(ret, linters)
-
-	sort.Slice(ret, func(i, j int) bool {
-		return ret[i].GetSpeed() < ret[j].GetSpeed()
-	})
-
-	return ret
-}
-
-func (r *Runner) runWorkers(ctx context.Context, lintCtx *linter.Context, linters []*linter.Config) <-chan lintRes {
-	tasksCh := make(chan *linter.Config, len(linters))
-	lintResultsCh := make(chan lintRes, len(linters))
-	var wg sync.WaitGroup
-
-	workersFinishTimes := make([]time.Time, lintCtx.Cfg.Run.Concurrency)
-
-	for i := 0; i < lintCtx.Cfg.Run.Concurrency; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			name := fmt.Sprintf("worker.%d", i+1)
-			r.runWorker(ctx, lintCtx, tasksCh, lintResultsCh, name)
-			workersFinishTimes[i] = time.Now()
-		}(i)
-	}
-
-	lcs := getSortedLintersConfigs(linters)
-	for _, lc := range lcs {
-		tasksCh <- lc
-	}
-	close(tasksCh)
-
-	go func() {
-		wg.Wait()
-		close(lintResultsCh)
-
-		r.logWorkersStat(workersFinishTimes)
-	}()
-
-	return lintResultsCh
-}
-
 type processorStat struct {
 	inCount  int
 	outCount int
 }
 
-func (r Runner) processLintResults(inCh <-chan lintRes) <-chan lintRes {
-	outCh := make(chan lintRes, 64)
+func (r Runner) processLintResults(inIssues []result.Issue) []result.Issue {
+	sw := timeutils.NewStopwatch("processing", r.Log)
 
-	go func() {
-		sw := timeutils.NewStopwatch("processing", r.Log)
+	var issuesBefore, issuesAfter int
+	statPerProcessor := map[string]processorStat{}
 
-		var issuesBefore, issuesAfter int
-		statPerProcessor := map[string]processorStat{}
-		defer close(outCh)
+	var outIssues []result.Issue
+	if len(inIssues) != 0 {
+		issuesBefore += len(inIssues)
+		outIssues = r.processIssues(inIssues, sw, statPerProcessor)
+		issuesAfter += len(outIssues)
+	}
 
-		for res := range inCh {
-			if res.err != nil {
-				r.Log.Warnf("Can't run linter %s: %s", res.linter.Name(), res.err)
-				continue
-			}
+	// finalize processors: logging, clearing, no heavy work here
 
-			if len(res.issues) != 0 {
-				issuesBefore += len(res.issues)
-				res.issues = r.processIssues(res.issues, sw, statPerProcessor)
-				issuesAfter += len(res.issues)
-				outCh <- res
-			}
-		}
+	for _, p := range r.Processors {
+		p := p
+		sw.TrackStage(p.Name(), func() {
+			p.Finish()
+		})
+	}
 
-		// finalize processors: logging, clearing, no heavy work here
+	if issuesBefore != issuesAfter {
+		r.Log.Infof("Issues before processing: %d, after processing: %d", issuesBefore, issuesAfter)
+	}
+	r.printPerProcessorStat(statPerProcessor)
+	sw.PrintStages()
 
-		for _, p := range r.Processors {
-			p := p
-			sw.TrackStage(p.Name(), func() {
-				p.Finish()
-			})
-		}
-
-		if issuesBefore != issuesAfter {
-			r.Log.Infof("Issues before processing: %d, after processing: %d", issuesBefore, issuesAfter)
-		}
-		r.printPerProcessorStat(statPerProcessor)
-		sw.PrintStages()
-	}()
-
-	return outCh
+	return outIssues
 }
 
 func (r Runner) printPerProcessorStat(stat map[string]processorStat) {
@@ -283,40 +221,23 @@ func (r Runner) printPerProcessorStat(stat map[string]processorStat) {
 	}
 }
 
-func collectIssues(resCh <-chan lintRes) <-chan result.Issue {
-	retIssues := make(chan result.Issue, 1024)
-	go func() {
-		defer close(retIssues)
+func (r Runner) Run(ctx context.Context, linters []*linter.Config, lintCtx *linter.Context) []result.Issue {
+	sw := timeutils.NewStopwatch("linters", r.Log)
+	defer sw.Print()
 
-		for res := range resCh {
-			if len(res.issues) == 0 {
-				continue
+	var issues []result.Issue
+	for _, lc := range linters {
+		sw.TrackStage(lc.Name(), func() {
+			linterIssues, err := r.runLinterSafe(ctx, lintCtx, lc)
+			if err != nil {
+				r.Log.Warnf("Can't run linter %s: %s", lc.Linter.Name(), err)
+				return
 			}
-
-			for _, i := range res.issues {
-				retIssues <- i
-			}
-		}
-	}()
-
-	return retIssues
-}
-
-func (r Runner) Run(ctx context.Context, linters []*linter.Config, lintCtx *linter.Context) <-chan result.Issue {
-	lintResultsCh := r.runWorkers(ctx, lintCtx, linters)
-	processedLintResultsCh := r.processLintResults(lintResultsCh)
-	if ctx.Err() != nil {
-		// XXX: always process issues, even if timeout occurred
-		finishedLintersN := 0
-		for range processedLintResultsCh {
-			finishedLintersN++
-		}
-
-		r.Log.Errorf("%d/%d linters finished: deadline exceeded",
-			finishedLintersN, len(linters))
+			issues = append(issues, linterIssues...)
+		})
 	}
 
-	return collectIssues(processedLintResultsCh)
+	return r.processLintResults(issues)
 }
 
 func (r *Runner) processIssues(issues []result.Issue, sw *timeutils.Stopwatch, statPerProcessor map[string]processorStat) []result.Issue {

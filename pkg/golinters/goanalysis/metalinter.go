@@ -2,7 +2,6 @@ package goanalysis
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/pkg/errors"
 	"golang.org/x/tools/go/analysis"
@@ -12,12 +11,11 @@ import (
 )
 
 type MetaLinter struct {
-	linters              []*Linter
-	analyzerToLinterName map[*analysis.Analyzer]string
+	linters []*Linter
 }
 
-func NewMetaLinter(linters []*Linter, analyzerToLinterName map[*analysis.Analyzer]string) *MetaLinter {
-	return &MetaLinter{linters: linters, analyzerToLinterName: analyzerToLinterName}
+func NewMetaLinter(linters []*Linter) *MetaLinter {
+	return &MetaLinter{linters: linters}
 }
 
 func (ml MetaLinter) Name() string {
@@ -42,27 +40,74 @@ func (ml MetaLinter) Run(ctx context.Context, lintCtx *linter.Context) ([]result
 	}
 
 	var allAnalyzers []*analysis.Analyzer
+	analyzerToLinterName := map[*analysis.Analyzer]string{}
 	for _, linter := range ml.linters {
+		if linter.contextSetter != nil {
+			linter.contextSetter(lintCtx)
+		}
+
 		allAnalyzers = append(allAnalyzers, linter.analyzers...)
+		for _, a := range linter.analyzers {
+			analyzerToLinterName[a] = linter.Name()
+		}
 	}
 
-	runner := newRunner("metalinter", lintCtx.Log.Child("goanalysis"), lintCtx.PkgCache, lintCtx.LoadGuard, lintCtx.NeedWholeProgram)
+	loadMode := LoadModeNone
+	for _, linter := range ml.linters {
+		if linter.loadMode > loadMode {
+			loadMode = linter.loadMode
+		}
+	}
 
-	diags, errs := runner.run(allAnalyzers, lintCtx.Packages)
+	isTypecheckMode := false
+	for _, linter := range ml.linters {
+		if linter.isTypecheckMode {
+			isTypecheckMode = true
+			break
+		}
+	}
+
+	useOriginalPackages := false
+	for _, linter := range ml.linters {
+		if linter.useOriginalPackages {
+			useOriginalPackages = true
+			break
+		}
+	}
+
+	runner := newRunner("metalinter", lintCtx.Log.Child("goanalysis"), lintCtx.PkgCache, lintCtx.LoadGuard, loadMode)
+
+	pkgs := lintCtx.Packages
+	if useOriginalPackages {
+		pkgs = lintCtx.OriginalPackages
+	}
+
+	diags, errs := runner.run(allAnalyzers, pkgs)
+
+	buildAllIssues := func() []result.Issue {
+		linterNameBuilder := func(diag *Diagnostic) string { return analyzerToLinterName[diag.Analyzer] }
+		issues := buildIssues(diags, linterNameBuilder)
+
+		for _, linter := range ml.linters {
+			if linter.issuesReporter != nil {
+				issues = append(issues, linter.issuesReporter(lintCtx)...)
+			}
+		}
+		return issues
+	}
+
+	if isTypecheckMode {
+		issues, err := buildIssuesFromErrorsForTypecheckMode(errs, lintCtx)
+		if err != nil {
+			return nil, err
+		}
+		return append(issues, buildAllIssues()...), nil
+	}
+
 	// Don't print all errs: they can duplicate.
 	if len(errs) != 0 {
 		return nil, errs[0]
 	}
 
-	var issues []result.Issue
-	for i := range diags {
-		diag := &diags[i]
-		issues = append(issues, result.Issue{
-			FromLinter: ml.analyzerToLinterName[diag.Analyzer],
-			Text:       fmt.Sprintf("%s: %s", diag.Analyzer, diag.Message),
-			Pos:        diag.Position,
-		})
-	}
-
-	return issues, nil
+	return buildAllIssues(), nil
 }
