@@ -90,6 +90,12 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
 			WithSpeed(4).
 			WithAlternativeNames("vet", "vetshadow").
 			WithURL("https://golang.org/cmd/vet/"),
+		linter.NewConfig(golinters.NewEasyCheck()).
+			WithLoadForGoAnalysis().
+			WithPresets(linter.PresetBugs).
+			WithSpeed(4).
+			WithAlternativeNames("easy", "ez").
+			WithURL("https://github.com"),
 		linter.NewConfig(golinters.NewBodyclose()).
 			WithLoadForGoAnalysis().
 			WithPresets(linter.PresetPerformance, linter.PresetBugs).
@@ -104,7 +110,6 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
 			WithPresets(linter.PresetStyle).
 			WithSpeed(3).
 			WithURL("https://github.com/golang/lint"),
-
 		linter.NewConfig(golinters.NewStaticcheck()).
 			WithLoadForGoAnalysis().
 			WithPresets(linter.PresetBugs).
@@ -261,15 +266,16 @@ func (m Manager) GetAllSupportedLinterConfigs() []*linter.Config {
 
 	isLocalRun := os.Getenv("GOLANGCI_COM_RUN") == ""
 	enabledByDefault := map[string]bool{
-		golinters.NewGovet(nil).Name(): true,
-		golinters.Errcheck{}.Name():    true,
-		golinters.Staticcheck{}.Name(): true,
-		golinters.Unused{}.Name():      true,
-		golinters.Gosimple{}.Name():    true,
-		golinters.Structcheck{}.Name(): true,
-		golinters.Varcheck{}.Name():    true,
-		golinters.Ineffassign{}.Name(): true,
-		golinters.Deadcode{}.Name():    true,
+		golinters.NewGovet(nil).Name():  true,
+		golinters.Errcheck{}.Name():     true,
+		golinters.NewEasyCheck().Name(): true,
+		golinters.Staticcheck{}.Name():  true,
+		golinters.Unused{}.Name():       true,
+		golinters.Gosimple{}.Name():     true,
+		golinters.Structcheck{}.Name():  true,
+		golinters.Varcheck{}.Name():     true,
+		golinters.Ineffassign{}.Name():  true,
+		golinters.Deadcode{}.Name():     true,
 
 		// don't typecheck for golangci.com: too many troubles
 		golinters.TypeCheck{}.Name(): isLocalRun,
